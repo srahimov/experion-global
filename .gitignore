@@ -1,0 +1,10 @@
+node_modules/
+dist/
+reports/allure-report/
+reports/html/
+allure-results/
+test-results/
+.env.local
+*.log
+.DS_Store
+coverage/
