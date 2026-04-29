@@ -1,0 +1,249 @@
+pipeline {
+    agent any
+
+    environment {
+        NODE_VERSION   = '20'
+        BASE_URL       = 'https://experionglobal.com'
+        HEADLESS       = 'true'
+        BROWSER        = "${params.BROWSER ?: 'chromium'}"
+        ENV            = "${params.ENVIRONMENT ?: 'qa'}"
+        ALLURE_RESULTS = 'allure-results'
+        REPORT_DIR     = 'reports'
+    }
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['qa', 'dev'],
+            description: 'Target environment to run tests against'
+        )
+        choice(
+            name: 'BROWSER',
+            choices: ['chromium', 'firefox', 'webkit'],
+            description: 'Browser to run E2E tests on'
+        )
+        choice(
+            name: 'TEST_SUITE',
+            choices: ['smoke', 'regression', 'all', 'home', 'services', 'contact'],
+            description: 'Test suite / tag to run'
+        )
+        booleanParam(
+            name: 'RUN_UNIT_TESTS',
+            defaultValue: true,
+            description: 'Run Vitest unit tests'
+        )
+        booleanParam(
+            name: 'RUN_E2E_TESTS',
+            defaultValue: true,
+            description: 'Run Playwright + Cucumber E2E tests'
+        )
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        // ─── Stage 1: Checkout ─────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                echo '📥 Checking out source code...'
+                checkout scm
+                sh 'git log --oneline -5'
+            }
+        }
+
+        // ─── Stage 2: Setup Node.js ────────────────────────────────────
+        stage('Setup Node.js') {
+            steps {
+                echo "🔧 Setting up Node.js ${NODE_VERSION}..."
+                sh '''
+                    node --version
+                    npm --version
+                '''
+            }
+        }
+
+        // ─── Stage 3: Install Dependencies ────────────────────────────
+        stage('Install Dependencies') {
+            steps {
+                echo '📦 Installing npm dependencies...'
+                sh 'npm ci'
+            }
+        }
+
+        // ─── Stage 4: TypeScript Type Check ───────────────────────────
+        stage('TypeScript Type Check') {
+            steps {
+                echo '🔍 Running TypeScript type check...'
+                sh 'npx tsc --noEmit'
+            }
+        }
+
+        // ─── Stage 5: Install Playwright Browsers ─────────────────────
+        stage('Install Playwright Browsers') {
+            when {
+                expression { params.RUN_E2E_TESTS == true }
+            }
+            steps {
+                echo "🌐 Installing Playwright browser: ${BROWSER}..."
+                sh "npx playwright install --with-deps ${BROWSER}"
+            }
+        }
+
+        // ─── Stage 6: Unit Tests ───────────────────────────────────────
+        stage('Unit Tests') {
+            when {
+                expression { params.RUN_UNIT_TESTS == true }
+            }
+            steps {
+                echo '🧪 Running Vitest unit tests...'
+                sh '''
+                    mkdir -p reports/coverage
+                    npm run test:unit:coverage
+                '''
+            }
+            post {
+                always {
+                    publishHTML(target: [
+                        allowMissing         : true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll              : true,
+                        reportDir            : 'reports/coverage',
+                        reportFiles          : 'index.html',
+                        reportName           : 'Vitest Coverage Report'
+                    ])
+                }
+            }
+        }
+
+        // ─── Stage 7: E2E Tests ────────────────────────────────────────
+        stage('E2E Tests') {
+            when {
+                expression { params.RUN_E2E_TESTS == true }
+            }
+            steps {
+                echo "🚀 Running E2E tests — Suite: ${params.TEST_SUITE}, Browser: ${BROWSER}..."
+                sh '''
+                    mkdir -p reports/html
+                    mkdir -p allure-results
+                    mkdir -p reports/allure-report
+                    mkdir -p reports/screenshots
+                '''
+                script {
+                    def tag = ''
+                    switch(params.TEST_SUITE) {
+                        case 'smoke':
+                            tag = '--tags "@smoke"'
+                            break
+                        case 'regression':
+                            tag = '--tags "@regression"'
+                            break
+                        case 'home':
+                            tag = '--tags "@home"'
+                            break
+                        case 'services':
+                            tag = '--tags "@services"'
+                            break
+                        case 'contact':
+                            tag = '--tags "@contact"'
+                            break
+                        default:
+                            tag = ''
+                    }
+                    sh "cross-env ENV=${ENV} BROWSER=${BROWSER} HEADLESS=${HEADLESS} npx cucumber-js ${tag}"
+                }
+            }
+            post {
+                always {
+                    // Publish Cucumber HTML report
+                    publishHTML(target: [
+                        allowMissing         : true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll              : true,
+                        reportDir            : 'reports/html',
+                        reportFiles          : 'cucumber-report.html',
+                        reportName           : 'Cucumber HTML Report'
+                    ])
+
+                    // Archive screenshots on failure
+                    archiveArtifacts(
+                        artifacts: 'reports/screenshots/**/*.png',
+                        allowEmptyArchive: true
+                    )
+
+                    // Archive JSON report
+                    archiveArtifacts(
+                        artifacts: 'reports/cucumber-report.json',
+                        allowEmptyArchive: true
+                    )
+                }
+            }
+        }
+
+        // ─── Stage 8: Generate Allure Report ──────────────────────────
+        stage('Generate Allure Report') {
+            when {
+                expression { params.RUN_E2E_TESTS == true }
+            }
+            steps {
+                echo '📊 Generating Allure report...'
+                sh 'npx allure generate allure-results --clean -o reports/allure-report'
+            }
+            post {
+                always {
+                    allure([
+                        includeProperties: false,
+                        jdk              : '',
+                        properties       : [],
+                        reportBuildPolicy: 'ALWAYS',
+                        results          : [[path: 'allure-results']]
+                    ])
+                }
+            }
+        }
+    }
+
+    // ─── Post Actions ──────────────────────────────────────────────────
+    post {
+        always {
+            echo '🧹 Cleaning up workspace...'
+            cleanWs(
+                cleanWhenAborted : true,
+                cleanWhenFailure : false,
+                cleanWhenSuccess : true,
+                deleteDirs       : true,
+                patterns         : [[pattern: 'node_modules', type: 'INCLUDE']]
+            )
+        }
+        success {
+            echo """
+            ✅ Pipeline PASSED
+            ─────────────────────────────
+            Branch      : ${env.BRANCH_NAME}
+            Environment : ${ENV}
+            Browser     : ${BROWSER}
+            Suite       : ${params.TEST_SUITE}
+            Build URL   : ${env.BUILD_URL}
+            """
+        }
+        failure {
+            echo """
+            ❌ Pipeline FAILED
+            ─────────────────────────────
+            Branch      : ${env.BRANCH_NAME}
+            Environment : ${ENV}
+            Browser     : ${BROWSER}
+            Suite       : ${params.TEST_SUITE}
+            Build URL   : ${env.BUILD_URL}
+            """
+        }
+        unstable {
+            echo '⚠️ Pipeline is UNSTABLE — some tests may have failed.'
+        }
+    }
+}

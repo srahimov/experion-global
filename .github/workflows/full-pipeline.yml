@@ -1,0 +1,209 @@
+name: Full CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'qa'
+        type: choice
+        options:
+          - dev
+          - qa
+      run_e2e:
+        description: 'Run E2E tests?'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  NODE_VERSION: '20.x'
+  ENV: ${{ github.event.inputs.environment || 'qa' }}
+
+jobs:
+  # ─── Stage 1: Install & Lint ────────────────────────────────────────
+  install-and-lint:
+    name: Install & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('package-lock.json') }}
+
+  # ─── Stage 2: Unit Tests ────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests (Vitest)
+    runs-on: ubuntu-latest
+    needs: install-and-lint
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('package-lock.json') }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests with coverage
+        run: npm run test:unit:coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-coverage-report
+          path: reports/coverage/
+          retention-days: 14
+
+  # ─── Stage 3: Smoke Tests ───────────────────────────────────────────
+  smoke-tests:
+    name: Smoke Tests (Chromium)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    env:
+      HEADLESS: true
+      BROWSER: chromium
+      BASE_URL: https://experionglobal.com
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Create report directories
+        run: mkdir -p reports/html allure-results reports/allure-report
+
+      - name: Run smoke tests
+        run: npm run test:qa -- --tags "@smoke"
+
+      - name: Generate Allure report
+        if: always()
+        run: npx allure generate allure-results --clean -o reports/allure-report
+
+      - name: Upload smoke test report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-test-report
+          path: |
+            reports/allure-report/
+            reports/html/
+          retention-days: 7
+
+  # ─── Stage 4: Full Regression (parallel browsers) ───────────────────
+  regression-tests:
+    name: Regression - ${{ matrix.browser }}
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    if: ${{ github.event.inputs.run_e2e != 'false' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [ chromium, firefox, webkit ]
+
+    env:
+      HEADLESS: true
+      BASE_URL: https://experionglobal.com
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser - ${{ matrix.browser }}
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Create report directories
+        run: mkdir -p reports/html allure-results reports/allure-report
+
+      - name: Run regression tests
+        env:
+          BROWSER: ${{ matrix.browser }}
+        run: npm run test:qa -- --tags "@regression"
+
+      - name: Generate Allure report
+        if: always()
+        run: npx allure generate allure-results --clean -o reports/allure-report
+
+      - name: Upload regression report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regression-report-${{ matrix.browser }}
+          path: |
+            reports/allure-report/
+            reports/html/
+            allure-results/
+          retention-days: 14
+
+  # ─── Stage 5: Notify ────────────────────────────────────────────────
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [ unit-tests, smoke-tests, regression-tests ]
+    if: always()
+
+    steps:
+      - name: Notify success
+        if: ${{ needs.regression-tests.result == 'success' }}
+        run: echo "✅ All pipeline stages passed successfully!"
+
+      - name: Notify failure
+        if: ${{ needs.regression-tests.result == 'failure' }}
+        run: |
+          echo "❌ Pipeline failed at regression stage."
+          exit 1
